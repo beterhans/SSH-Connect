@@ -178,6 +178,7 @@ impl SshConnectServer {
         };
 
         let mut session = Session::new(name.clone(), target.clone(), prompt, transport);
+        let session_transcript = session.transcript.clone();
 
         // Optional wake: send a carriage return and capture the banner/prompt.
         let mut banner = None;
@@ -194,6 +195,7 @@ impl SshConnectServer {
             "protocol": protocol.to_string(),
             "target": target,
             "banner": banner,
+            "transcript": session_transcript,
         })))
     }
 

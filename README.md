@@ -65,6 +65,33 @@ relying on a long timeout (see the `vps-management` skill).
   and delta), driven by `vps_health_check`.
 - **health-report** — a standardized HTML network-device health report (plus JSON
   sidecar).
+- **ssh-connect** — how to drive this MCP server itself: console vs server tool
+  families, credential precedence, prompt regexes, transcript log, auth ladder.
+- **ssh-connect-legacy-devices** — playbook for old gear (Alcatel iSAM OLTs, 2015-era
+  IOS-XE): legacy algorithm negotiation, exec-vs-shell channels, the `^H` erase
+  character, pagers, and a failure → cause → fix table.
+
+### Client-side skills
+
+Skills that guide the *agent* using this server live in the MCP client's own skills
+directory — `~/.config/opencode/skills/<name>/SKILL.md` for opencode,
+`~/.claude/skills/<name>/SKILL.md` for Claude Code. A `SKILL.md` needs YAML front
+matter with `name` and `description`:
+
+```markdown
+---
+name: ssh-connect
+description: Manage remote servers, network devices and consoles over SSH/Telnet/Serial via the ssh-connect MCP server. Use when asked to connect to a host, run commands on a switch/router/OLT, or reach a legacy device that only supports old SSH algorithms.
+---
+
+# ssh-connect
+…
+```
+
+Two ready-to-use skills for the legacy-device workflow (`ssh-connect` and
+`ssh-connect-legacy-devices`) ship in this repository under `skills/`; copy the folder
+into the client's skills directory and adjust the `description` to match your own
+tools.
 
 ## Agents (`.claude/agents/`)
 
@@ -116,7 +143,83 @@ Or in an MCP settings file:
 The server speaks MCP over stdio; all logging goes to stderr (set `RUST_LOG=info` to see
 broker/role messages).
 
+### opencode
+
+opencode keeps MCP servers under `mcp.servers` in `~/.config/opencode/opencode.json`.
+The `environment` block is where the server's environment variables go — they are
+applied to the server process, exactly like `env:` in a Claude Code config:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "ssh-connect": {
+        "type": "local",
+        "command": [
+          "/path/to/ssh-connect/target/release/ssh-connect"
+        ],
+        "environment": {
+          "SSHCONNECT_HOSTS": "/path/to/ssh-connect/hosts.toml",
+          "SSHCONNECT_SESSION_LOG_DIR": "/Users/you/.ssh-connect/logs"
+        }
+      }
+    }
+  }
+}
+```
+
+Or from the shell (writes the same entry):
+
+```sh
+opencode mcp add ssh-connect --global \
+  --env SSHCONNECT_HOSTS=/path/to/hosts.toml \
+  --env SSHCONNECT_SESSION_LOG_DIR="$HOME/.ssh-connect/logs" \
+  -- /path/to/ssh-connect/target/release/ssh-connect
+```
+
+### Claude Desktop / Claude Code (`mcpServers`)
+
+The `env` key is the equivalent of opencode's `environment`:
+
+```json
+{
+  "mcpServers": {
+    "ssh-connect": {
+      "command": "/path/to/ssh-connect/target/release/ssh-connect",
+      "env": {
+        "SSHCONNECT_HOSTS": "/path/to/hosts-connect/hosts.toml",
+        "SSHCONNECT_SESSION_LOG_DIR": "/Users/you/.ssh-connect/logs",
+        "SSHCONNECT_HOST_KEY_CHECK": "tofu"
+      }
+    }
+  }
+}
+```
+
+## Environment variables
+
+All configuration is environment variables on the server process — there is no config
+file to parse besides the host inventory.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SSHCONNECT_HOSTS` | `hosts.toml` in the current working directory | Path to the host inventory (see `hosts.example.toml`). A missing file yields an empty inventory, not an error. |
+| `SSHCONNECT_<STEM>_<FIELD>` | — | Per-host override from the environment. `<STEM>` is the host name upper-cased with non-alphanumerics collapsed to `_` (`core-sw-01` → `CORE_SW_01`). Fields: `PASSWORD`, `USERNAME`, `HOST`, `PORT`, `KEY_PATH`. |
+| `SSHCONNECT_SESSION_LOG` | on | Set to `off` (or `0`/`false`/`no`/`disabled`) to disable the session transcript log entirely. |
+| `SSHCONNECT_SESSION_LOG_DIR` | `~/.ssh-connect/logs` | Directory for session transcripts (`<session>.log`). |
+| `SSHCONNECT_HOST_KEY_CHECK` | off (accept any key) | Set to `tofu` for trust-on-first-use against `~/.ssh-connect/known_hosts`; a later key mismatch is refused. The legacy name `VPS_HOST_KEY_CHECK` is also accepted. |
+| `SSH_AUTH_SOCK` | — | Unix ssh-agent socket used for agent authentication (on Windows the OpenSSH named pipe `\\.\pipe\openssh-ssh-agent` is used when unset). |
+| `XDG_RUNTIME_DIR` | temp dir | Where the broker's Unix domain socket is created. |
+| `RUST_LOG` | — | Log level (`info`, `debug`, …). Logs go to stderr, never to stdout (stdout is the MCP channel). |
+
+Secrets are best passed through the environment (`SSHCONNECT_<STEM>_PASSWORD`) or an
+ssh-agent identity rather than written into `hosts.toml`.
+
 ## Configuration
+
+Everything is configured through environment variables — see the
+[Environment variables](#environment-variables) table above for the full list.
 
 - **Inventory:** copy `hosts.example.toml` to `hosts.toml` and edit. The `connect` tool
   can then reach a device by `name` alone. Override the path with `SSHCONNECT_HOSTS`.
@@ -126,7 +229,18 @@ broker/role messages).
 - **Host-key checking (server-ops SSH):** accepts any key by default. Set
   `SSHCONNECT_HOST_KEY_CHECK=tofu` (the legacy `VPS_HOST_KEY_CHECK` is also accepted) to
   enable trust-on-first-use against `~/.ssh-connect/known_hosts`, which refuses a later
-  key mismatch.
+  key mismatch. The interactive-console path (`connect`) does not pin host keys.
+- **Session transcript log:** every interactive session records all wire traffic in both
+  directions to `~/.ssh-connect/logs/<session>.log` (control characters escaped, so the
+  file stays readable). The path is returned by `connect` and `list_sessions`. Set
+  `SSHCONNECT_SESSION_LOG=off` to disable it or `SSHCONNECT_SESSION_LOG_DIR` to relocate
+  it. Secrets are **not** masked — treat these files as sensitive.
+- **Legacy SSH devices:** old network gear (Alcatel-Lucent iSAM OLTs, 2015-era IOS-XE,
+  old appliances) that only offer SHA-1 key exchange, `ssh-rsa`/`ssh-dss` host keys, CBC
+  ciphers and `hmac-sha1` are negotiated automatically — modern algorithms stay first in
+  every list, legacy ones are used only when the device offers nothing else. The
+  `dsa` feature of `russh` must stay enabled, otherwise `ssh-dss` is advertised but
+  cannot be verified and the handshake fails with "unsupported algorithm: ssh-dss".
 - **SSH client config:** resolution is delegated to the local OpenSSH client — both
   connect tools run `ssh -G <host>` and use the HostName, User, Port and IdentityFile it
   reports, so `Host`/`Match` blocks, `Include`s, wildcards, percent tokens,
@@ -139,6 +253,24 @@ broker/role messages).
   `useAgent: false` (`use_agent` on `connect`) to force a specific credential instead.
   RSA identities are signed with the strongest hash the server advertises, so agent auth
   also works against OpenSSH 8.8+, which rejects SHA-1 `ssh-rsa`.
+- **Prompt regex:** `run_command` ends when the device's prompt matches the pattern, so
+  the pattern must be **end-anchored** (`\s*$`). A pattern that merely *contains* the
+  prompt also matches the line where a device redraws its prompt and echoes the command
+  at the same time — the read then ends before the output arrives and the leftover is
+  reported as the *next* command's output. A pattern that does not match at all burns
+  the full timeout and returns `timed_out: true`. Set it per host with `prompt = "..."`
+  in `hosts.toml` or per call with `connect {prompt: "..."}`.
+
+  | Device | Pattern |
+  |---|---|
+  | default (most switches) | `[\w.@:~()/\\-]+[#>$]\s*$` |
+  | iSAM / typical CLI | `[#>$]\s*$` |
+  | zsh (user@host path %) | `[\w.-]+@[\w.-]+ [^\r\n]*%\s*$` |
+
+  The transcript log shows the exact prompt bytes — match against that, never guess.
+- **Prompt/erase handling:** backspaces are applied with their real erase semantics, so
+  a device that uses `^H` as its erase key (the Alcatel iSAM does) no longer duplicates
+  the first character of a redrawn line.
 
 ## Broker (multi-instance session sharing)
 
@@ -154,6 +286,12 @@ Limitation: if the owner process exits, existing proxies do not currently re-ele
 owner mid-session — restart the affected client. A newly started instance always elects
 correctly (and clears a stale socket).
 
+**Restart the server after a rebuild.** The owner process is long-lived and keeps serving
+the binary it was started with, so a rebuilt binary has no effect until the server
+restarts (in opencode: `/reload`). A second instance started while an owner is running
+becomes a proxy and forwards to the *old* owner — which is why a fix can appear to have
+had no effect.
+
 ## Tests
 
 ```sh
@@ -164,6 +302,15 @@ Unit tests cover the telnet IAC parser, prompt/ANSI output handling, the host in
 `ssh -G` alias resolution, serial-port probing, and the legacy SSH algorithm set.
 Protocol and broker behavior are checked by sending an `initialize` + `tools/list`
 sequence to the binary and by running two instances to confirm owner/proxy election.
+
+## Documentation
+
+- `MCP_EXPLAINED.md` — how the server works: architecture, the two tool families,
+  credential precedence, host-key policy, legacy algorithms, the transcript log, and
+  device-specific notes.
+- `LEGACY_SSH_TESTING.md` — how to test legacy-SSH support (fake legacy SSH server,
+  per-algorithm isolation matrix, negative control).
+- `LEGACY_SSH_HANDOFF.md` — historical handoff notes from the legacy-SSH work.
 
 ## License
 

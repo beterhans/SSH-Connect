@@ -27,6 +27,10 @@ pub struct SessionInfo {
     pub name: String,
     pub protocol: super::Protocol,
     pub target: String,
+    /// Path of this session's transcript log (every byte sent/received), when
+    /// session logging is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
 }
 
 impl SessionManager {
@@ -77,6 +81,7 @@ impl SessionManager {
                 name: s.name.clone(),
                 protocol: s.protocol,
                 target: s.target.clone(),
+                transcript: s.transcript.clone(),
             });
         }
         infos.sort_by(|a, b| a.name.cmp(&b.name));

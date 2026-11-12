@@ -11,7 +11,7 @@ use crate::ssh_config::{self, Credentials};
 use async_trait::async_trait;
 use russh::client::{self, Handle, Msg};
 use russh::keys::{Algorithm, EcdsaCurve, HashAlg, PublicKey};
-use russh::{cipher, kex, Channel, ChannelMsg, Disconnect, Preferred};
+use russh::{cipher, kex, mac, Channel, ChannelMsg, Disconnect, Preferred};
 use russh_sftp::client::SftpSession;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -22,19 +22,25 @@ use tokio::io::AsyncWriteExt;
 /// Algorithm preferences with legacy fallback for old network gear.
 ///
 /// russh's defaults are modern-only, but 2015–2017-era IOS-XE (e.g. Catalyst
-/// 3850 on 3.x) offers only `diffie-hellman-group14-sha1`/`group1-sha1` key
-/// exchange, an `ssh-rsa` host key, and CTR/CBC ciphers — the default config
-/// refuses the handshake outright. Modern algorithms stay FIRST in every list,
-/// so current devices still negotiate strong crypto; the legacy entries are
-/// only used when they're all the server has.
-fn legacy_compatible_preferred() -> Preferred {
+/// 3850 on 3.x) and older OLTs (Alcatel-Lucent iSAM) offer only SHA-1 DH key
+/// exchange (`diffie-hellman-group-exchange-sha1`, `group14-sha1`,
+/// `group1-sha1`), an `ssh-rsa` or even a DSA (`ssh-dss`) host key, CTR/CBC
+/// ciphers and `hmac-sha1` MACs — the default config refuses such a
+/// handshake outright. Modern algorithms stay FIRST in every list, so current
+/// devices still negotiate strong crypto; the legacy entries are only used
+/// when they're all the server has. Shared by both SSH paths (this module's
+/// interactive console and `ssh_tools`' exec/SFTP) via [`crate::tools`].
+pub fn legacy_compatible_preferred() -> Preferred {
     Preferred {
         kex: Cow::Borrowed(&[
             kex::CURVE25519,
             kex::CURVE25519_PRE_RFC_8731,
             kex::DH_G16_SHA512,
             kex::DH_G14_SHA256,
-            // Legacy fallback (old IOS/IOS-XE, ancient appliances):
+            // Legacy fallback (old IOS/IOS-XE, iSAM OLTs, ancient appliances):
+            // GEX first — it negotiates a 2048-bit group where the server
+            // supports one, unlike fixed g1 (1024) / g14.
+            kex::DH_GEX_SHA1,
             kex::DH_G14_SHA1,
             kex::DH_G1_SHA1,
             kex::EXTENSION_SUPPORT_AS_CLIENT,
@@ -49,6 +55,9 @@ fn legacy_compatible_preferred() -> Preferred {
             // Legacy fallback: SHA-1-signed RSA host keys (only host-key type
             // old IOS-XE presents) — `ssh-rsa`.
             Algorithm::Rsa { hash: None },
+            // Legacy fallback: DSA host keys — old Alcatel/NTT-era OLTs
+            // (e.g. iSAM) still present `ssh-dss`.
+            Algorithm::Dsa,
         ]),
         cipher: Cow::Borrowed(&[
             cipher::CHACHA20_POLY1305,
@@ -62,7 +71,17 @@ fn legacy_compatible_preferred() -> Preferred {
             cipher::AES_128_CBC,
             cipher::TRIPLE_DES_CBC,
         ]),
-        // Default MAC order already ends with hmac-sha1; default compression is fine.
+        // russh 0.60's default MAC list is SHA-2-only; old gear negotiates
+        // `hmac-sha1` (or the ETM variant) — keep modern MACs first.
+        mac: Cow::Borrowed(&[
+            mac::HMAC_SHA512_ETM,
+            mac::HMAC_SHA256_ETM,
+            mac::HMAC_SHA512,
+            mac::HMAC_SHA256,
+            mac::HMAC_SHA1_ETM,
+            mac::HMAC_SHA1,
+        ]),
+        // Default compression (none + zlib when `flate2` is enabled) is fine.
         ..Preferred::DEFAULT
     }
 }
@@ -273,21 +292,32 @@ impl Transport for SshTransport {
 mod tests {
     use super::*;
 
-    /// Old IOS-XE (Catalyst 3850 on 3.x) needs SHA-1 DH kex, ssh-rsa host keys,
-    /// and CBC fallback ciphers. Guard that the preference lists keep them, and
-    /// that modern algorithms still come first.
+    /// Old IOS-XE (Catalyst 3850 on 3.x) and iSAM OLTs need SHA-1 DH kex
+    /// (incl. group-exchange), ssh-rsa/ssh-dss host keys, CBC fallback ciphers
+    /// and hmac-sha1 MACs. Guard that the preference lists keep them, and that
+    /// modern algorithms still come first.
     #[test]
     fn preferred_includes_legacy_algorithms_after_modern_ones() {
         let p = legacy_compatible_preferred();
 
         let kex: Vec<&str> = p.kex.iter().map(|n| n.as_ref()).collect();
         assert!(kex.contains(&"diffie-hellman-group14-sha1"));
+        assert!(kex.contains(&"diffie-hellman-group-exchange-sha1"));
         assert!(kex.contains(&"diffie-hellman-group1-sha1"));
         assert_eq!(kex[0], "curve25519-sha256", "modern kex must stay first");
+
+        assert!(
+            p.key.iter().any(|k| matches!(k, Algorithm::Dsa)),
+            "ssh-dss host keys (old iSAM/Alcatel OLTs) must stay offerable"
+        );
 
         let ciphers: Vec<&str> = p.cipher.iter().map(|n| n.as_ref()).collect();
         assert!(ciphers.contains(&"aes128-cbc"));
         assert!(ciphers.contains(&"3des-cbc"));
         assert_eq!(ciphers[0], "chacha20-poly1305@openssh.com");
+
+        let macs: Vec<&str> = p.mac.iter().map(|n| n.as_ref()).collect();
+        assert!(macs.contains(&"hmac-sha1"), "old gear negotiates hmac-sha1");
+        assert_eq!(macs[0], "hmac-sha2-512-etm@openssh.com", "modern MAC must stay first");
     }
 }

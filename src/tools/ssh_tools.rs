@@ -141,7 +141,15 @@ impl SshConnectServer {
         }
         identity_files.extend(defaults.identity_files);
 
-        let config = Arc::new(client::Config::default());
+        // let config = Arc::new(client::Config::default());
+        // Legacy-compatible algorithm preferences (same list as the
+        // interactive-console path) so old gear — SHA-1 DH kex, ssh-rsa /
+        // ssh-dss host keys, CBC/3DES ciphers, hmac-sha1 — also works with
+        // the exec/SFTP tools; modern devices still negotiate strong crypto.
+        let config = Arc::new(client::Config {
+            preferred: crate::transport::ssh::legacy_compatible_preferred(),
+            ..Default::default()
+        });
         let addr = format!("{host}:{port}");
 
         let handler = VpsClientHandler {

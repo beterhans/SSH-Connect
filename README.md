@@ -126,7 +126,18 @@ broker/role messages).
 - **Host-key checking (server-ops SSH):** accepts any key by default. Set
   `SSHCONNECT_HOST_KEY_CHECK=tofu` (the legacy `VPS_HOST_KEY_CHECK` is also accepted) to
   enable trust-on-first-use against `~/.ssh-connect/known_hosts`, which refuses a later
-  key mismatch.
+  key mismatch. The interactive-console path (`connect`) does not pin host keys.
+- **Session transcript log:** every interactive session records all wire traffic in both
+  directions to `~/.ssh-connect/logs/<session>.log` (control characters escaped, so the
+  file stays readable). The path is returned by `connect` and `list_sessions`. Set
+  `SSHCONNECT_SESSION_LOG=off` to disable it or `SSHCONNECT_SESSION_LOG_DIR` to relocate
+  it. Secrets are **not** masked — treat these files as sensitive.
+- **Legacy SSH devices:** old network gear (Alcatel-Lucent iSAM OLTs, 2015-era IOS-XE,
+  old appliances) that only offer SHA-1 key exchange, `ssh-rsa`/`ssh-dss` host keys, CBC
+  ciphers and `hmac-sha1` are negotiated automatically — modern algorithms stay first in
+  every list, legacy ones are used only when the device offers nothing else. The
+  `dsa` feature of `russh` must stay enabled, otherwise `ssh-dss` is advertised but
+  cannot be verified and the handshake fails with "unsupported algorithm: ssh-dss".
 - **SSH client config:** resolution is delegated to the local OpenSSH client — both
   connect tools run `ssh -G <host>` and use the HostName, User, Port and IdentityFile it
   reports, so `Host`/`Match` blocks, `Include`s, wildcards, percent tokens,
@@ -164,6 +175,15 @@ Unit tests cover the telnet IAC parser, prompt/ANSI output handling, the host in
 `ssh -G` alias resolution, serial-port probing, and the legacy SSH algorithm set.
 Protocol and broker behavior are checked by sending an `initialize` + `tools/list`
 sequence to the binary and by running two instances to confirm owner/proxy election.
+
+## Documentation
+
+- `MCP_EXPLAINED.md` — how the server works: architecture, the two tool families,
+  credential precedence, host-key policy, legacy algorithms, the transcript log, and
+  device-specific notes.
+- `LEGACY_SSH_TESTING.md` — how to test legacy-SSH support (fake legacy SSH server,
+  per-algorithm isolation matrix, negative control).
+- `LEGACY_SSH_HANDOFF.md` — historical handoff notes from the legacy-SSH work.
 
 ## License
 

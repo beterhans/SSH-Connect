@@ -653,6 +653,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsa"
+version = "0.7.0-rc.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "205b3f37ceb87c2ed5c72dac75f286848c68b19ba3246e9196f3666ce048a14b"
+dependencies = [
+ "crypto-bigint",
+ "crypto-primes",
+ "der",
+ "digest 0.11.3",
+ "rfc6979",
+ "sha2 0.11.0",
+ "signature",
+ "zeroize",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1069,6 +1085,7 @@ dependencies = [
  "argon2",
  "bcrypt-pbkdf",
  "crypto-bigint",
+ "dsa",
  "ecdsa",
  "ed25519-dalek",
  "hex",

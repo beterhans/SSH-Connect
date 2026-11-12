@@ -19,7 +19,10 @@ rmcp = { version = "1.8", features = [
 
 # SSH + SFTP (pure Rust, no C dependencies)
 # ring feature avoids the aws-lc-rs C build dependency (default on 0.60)
-russh = { version = "0.60", default-features = false, features = ["ring", "rsa", "flate2", "des"] }
+# dsa feature is required for ssh-dss host keys (old Alcatel iSAM OLTs) — without
+# it russh negotiates the algorithm but fails the handshake with
+# "unsupported algorithm: ssh-dss" when verifying the server's signature.
+russh = { version = "0.60", default-features = false, features = ["ring", "rsa", "flate2", "des", "dsa"] }
 russh-sftp = "2.1"
 
 # Telnet/Serial transports for interactive console management

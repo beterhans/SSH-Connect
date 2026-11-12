@@ -3,6 +3,7 @@
 
 pub mod manager;
 pub mod serial;
+pub mod session_log;
 pub mod ssh;
 pub mod telnet;
 
@@ -154,6 +155,8 @@ pub struct Session {
     pub target: String,
     /// Prompt regex used to detect end-of-output.
     pub prompt: Regex,
+    /// Path of this session's transcript log, when logging is enabled.
+    pub transcript: Option<String>,
     transport: Box<dyn Transport>,
 }
 
@@ -165,7 +168,25 @@ impl Session {
         transport: Box<dyn Transport>,
     ) -> Self {
         let protocol = transport.protocol();
-        Self { name, protocol, target, prompt, transport }
+        // Record every byte crossing the wire when the transcript log is on.
+        // Wrapping here (rather than at the call sites) also captures the
+        // reads that happen inside `read_until_prompt`, which bypass `Session`.
+        let (transport, transcript) = match session_log::open_session_log(&name) {
+            Some(log) => {
+                let path = log.path().display().to_string();
+                log.note(&format!(
+                    "session '{}' -> {} (protocol {})",
+                    name, target, protocol
+                ));
+                (
+                    Box::new(session_log::LoggedTransport::new(transport, log))
+                        as Box<dyn Transport>,
+                    Some(path),
+                )
+            }
+            None => (transport, None),
+        };
+        Self { name, protocol, target, prompt, transcript, transport }
     }
 
     /// Write `text` followed by the protocol's line ending.
@@ -201,7 +222,28 @@ impl Session {
     ) -> ToolResult<ReadOutcome> {
         // Drain any unsolicited banner/output already buffered so it doesn't
         // contaminate this command's response. Best-effort, short budget.
-        let _ = self.transport.read_chunk(Duration::from_millis(50)).await;
+        //
+        // Drain until the device goes quiet rather than reading a single
+        // chunk: a device that redraws its prompt when it accepts the previous
+        // line (zsh does) delivers that redraw in several chunks, and a
+        // one-chunk drain leaves the prompt half in the buffer — where it then
+        // matches the prompt regex and ends this command's read early.
+        let drain_deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            let remaining = drain_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match self
+                .transport
+                .read_chunk(std::cmp::min(remaining, Duration::from_millis(30)))
+                .await
+            {
+                Ok(chunk) if chunk.is_empty() => break, // device went quiet
+                Ok(_) => continue,                       // more buffered: keep draining
+                Err(_) => break,                         // best-effort
+            }
+        }
 
         if raw {
             self.transport.write_all(command.as_bytes()).await?;
@@ -393,13 +435,29 @@ pub async fn read_until_prompt(
             pattern.find(&cleaned).map(|m| m.as_str().trim().to_string())
         };
         if let Some(matched) = hit {
-            return Ok(ReadOutcome {
-                output: cleaned,
-                matched_prompt: Some(matched),
-                sub_prompt: None,
-                timed_out: false,
-                truncated: false,
-            });
+            // Settle before accepting the prompt as "end of output". A device
+            // that redraws its prompt while accepting the previous line (zsh
+            // does, and so do many switch CLIs) sends that redraw *before* it
+            // echoes the command we just sent — matching here would end the
+            // read before our output arrived, and the leftover would then be
+            // misread as the next command's output. If more data arrives
+            // right after the match, the match was a redraw, not the end.
+            let settle = std::cmp::min(deadline - now, Duration::from_millis(150));
+            match tokio::time::timeout(settle, transport.read_chunk(settle)).await {
+                Ok(Ok(more)) if !more.is_empty() => {
+                    raw.push_str(&String::from_utf8_lossy(&more));
+                    continue; // re-evaluate the pattern on the extended buffer
+                }
+                _ => {
+                    return Ok(ReadOutcome {
+                        output: cleaned,
+                        matched_prompt: Some(matched),
+                        sub_prompt: None,
+                        timed_out: false,
+                        truncated: false,
+                    });
+                }
+            }
         }
 
         // Sub-prompt detection (only on the command path): if the device is
@@ -420,6 +478,14 @@ pub async fn read_until_prompt(
 }
 
 /// Remove ANSI/VT100 escape sequences and carriage returns that switches emit.
+///
+/// Backspaces are handled with their erase semantics rather than simply
+/// dropped: a line editor (zsh's ZLE, and device CLIs whose erase key is
+/// `^H` — e.g. the iSAM) echoes `<char>^H<char>` to redraw the line it is
+/// typing. Dropping the `^H` would leave both characters behind and the
+/// echoed command would read `uuname -a` instead of `uname -a`. A pager, by
+/// contrast, erases in place with `^H ^H`; there the `^H` is followed by a
+/// space, so it is dropped and `--More--` stays intact for `strip_pager`.
 pub fn strip_ansi(s: &str) -> String {
     // CSI sequences: ESC [ ... final-byte ; plus lone ESC sequences.
     let mut out = String::with_capacity(s.len());
@@ -444,8 +510,20 @@ pub fn strip_ansi(s: &str) -> String {
                     i += 1;
                 }
             }
-        } else if c == '\r' || c == '\u{8}' {
-            i += 1; // drop carriage returns and backspaces (the pager erases with \b)
+        } else if c == '\r' {
+            i += 1; // drop carriage returns
+        } else if c == '\u{8}' {
+            // Backspace — erase the character it backs over, but only when a
+            // printable character follows (line-editor redraw). A pager's
+            // erase-in-place is followed by a space and is left alone.
+            let redraw = bytes
+                .get(i + 1)
+                .map(|n| !n.is_whitespace() && !n.is_control())
+                .unwrap_or(false);
+            if redraw {
+                out.pop();
+            }
+            i += 1;
         } else {
             out.push(c);
             i += 1;
@@ -491,6 +569,27 @@ mod tests {
     fn strips_ansi_and_cr() {
         let s = "\u{1b}[2J\u{1b}[Hhello\r\nworld\r\n";
         assert_eq!(strip_ansi(s), "hello\nworld\n");
+    }
+
+    #[test]
+    fn backspace_erases_redrawn_character() {
+        // zsh's ZLE (and CLIs whose erase key is ^H) echoes "<char>^H<char>"
+        // to redraw the line. The backspace must erase, not be dropped —
+        // otherwise the echoed command reads "uuname -a".
+        assert_eq!(strip_ansi("u\u{8}uname -a\r\n"), "uname -a\n");
+        assert_eq!(strip_ansi("e\u{8}echo hi"), "echo hi");
+        // A backspace with nothing printable after it is dropped, not applied
+        // (see the pager case below). A line editor's erase is always followed
+        // by the redrawn character, so the erase still lands.
+        assert_eq!(strip_ansi("abc\u{8}"), "abc");
+        assert_eq!(strip_ansi("abc\u{8}d"), "abd"); // erase 'c', then 'd'
+    }
+
+    #[test]
+    fn backspace_in_pager_erase_is_dropped() {
+        // A pager erases in place: "--More--^H ^H". Dropping the ^H keeps the
+        // marker intact so strip_pager can still match it.
+        assert_eq!(strip_ansi("--More--\u{8} \u{8}"), "--More-- ");
     }
 
     #[test]

@@ -3,3 +3,5 @@ hosts.toml
 *.log
 reports/
 backups/
+# Local file backups made before editing (see AGENTS.md backup convention)
+*.old
